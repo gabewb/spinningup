@@ -247,9 +247,27 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         obs, ret = data['obs'], data['ret']
         return ((ac.v(obs) - ret)**2).mean()
 
+    def compute_loss_predictor(data):
+        obs, act = data['obs'], data['act']
+        NUM_ACTIONS = 4.0 # TODO: get this from parameter
+        # observation with action concatenated
+        # perhaps this should be 1-hot rather than single parameter...
+        obs_cat_action = torch.cat((obs, torch.unsqueeze(act/NUM_ACTIONS, 1)), 1)
+        predictions = ac.predictor(obs_cat_action)
+
+        # We now need to strip off the first observation, and the last prediction.
+        # This way, we can compare prediction(obs_t, action_t) against obs_t+1.
+        # The last prediction has nothing to compare against, and there is no prediction
+        # for the first observation.
+        obs_shift = obs[1:, :]
+        predictions_shift = predictions[:-1, :]
+
+        return ((obs_shift-predictions_shift)**2).mean()
+
     # Set up optimizers for policy and value function
     pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
     vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr)
+    predictor_optimizer = Adam(ac.predictor.parameters(), lr=vf_lr) # use same lr as value function
 
     # Set up model saving
     logger.setup_pytorch_saver(ac)
@@ -260,6 +278,7 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         pi_l_old, pi_info_old = compute_loss_pi(data)
         pi_l_old = pi_l_old.item()
         v_l_old = compute_loss_v(data).item()
+        predictor_l_old = compute_loss_predictor(data).item()
 
         # Train policy with multiple steps of gradient descent
         for i in range(train_pi_iters):
@@ -283,12 +302,24 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             mpi_avg_grads(ac.v)    # average grads across MPI processes
             vf_optimizer.step()
 
+            # Predictor loss learning
+            predictor_optimizer.zero_grad()
+            loss_predictor = compute_loss_predictor(data)
+            # TODO(gabe): What does this do? Maybe this saves state, which is then
+            # collected by mpi_avg_grads... I guess??
+            loss_predictor.backward()
+            mpi_avg_grads(ac.predictor)
+            predictor_optimizer.step()
+
+
+        # TODO(gabe): learn to make the logger here save predictor output / predictor loss
         # Log changes from update
         kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
-        logger.store(LossPi=pi_l_old, LossV=v_l_old,
+        logger.store(LossPi=pi_l_old, LossV=v_l_old, LossPredictor=predictor_l_old,
                      KL=kl, Entropy=ent, ClipFrac=cf,
                      DeltaLossPi=(loss_pi.item() - pi_l_old),
-                     DeltaLossV=(loss_v.item() - v_l_old))
+                     DeltaLossV=(loss_v.item() - v_l_old),
+                     DeltaLossPredictor=(loss_predictor.item() - predictor_l_old))
 
     # Prepare for interaction with environment
     start_time = time.time()
@@ -297,13 +328,20 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
-            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            a, v, logp, predicted_o = ac.step(torch.as_tensor(o, dtype=torch.float32))
 
             next_o, r, d, _ = env.step(a)
             ep_ret += r
             ep_len += 1
 
             # save and log
+            # TODO(gabe): learn how to use buf.store and logger.store to make this not suck
+            if t % 1000 == 0:
+                print('prediction vs reality epoch {}, step {}'.format(epoch, t))
+                print('pred: ', predicted_o)
+                print('real: ', torch.tensor(next_o))
+                print('diff: ', predicted_o - torch.tensor(next_o))
+                print('loss: ', ((predicted_o - torch.tensor(next_o))**2).mean())
             buf.store(o, a, r, v, logp)
             logger.store(VVals=v)
             
@@ -319,7 +357,7 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if timeout or epoch_ended:
-                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                    _, v, _, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
                 else:
                     v = 0
                 buf.finish_path(v)
@@ -344,8 +382,10 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         logger.log_tabular('TotalEnvInteracts', (epoch+1)*steps)
         logger.log_tabular('LossPi', average_only=True)
         logger.log_tabular('LossV', average_only=True)
+        logger.log_tabular('LossPredictor', average_only=True)
         logger.log_tabular('DeltaLossPi', average_only=True)
         logger.log_tabular('DeltaLossV', average_only=True)
+        logger.log_tabular('DeltaLossPredictor', average_only=True)
         logger.log_tabular('Entropy', average_only=True)
         logger.log_tabular('KL', average_only=True)
         logger.log_tabular('ClipFrac', average_only=True)

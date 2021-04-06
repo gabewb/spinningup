@@ -95,7 +95,6 @@ class MLPGaussianActor(Actor):
 
 
 class MLPCritic(nn.Module):
-
     def __init__(self, obs_dim, hidden_sizes, activation):
         super().__init__()
         self.v_net = mlp([obs_dim] + list(hidden_sizes) + [1], activation)
@@ -103,7 +102,19 @@ class MLPCritic(nn.Module):
     def forward(self, obs):
         return torch.squeeze(self.v_net(obs), -1) # Critical to ensure v has right shape.
 
+class MLPPredictor(nn.Module):
+    # Really, should take in [obs] + [action], and spit out the new obs given that action.
+    # So, two basic forms: one is a crude auto-encoder (obs->obs), and the other is a predictor.
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+        super().__init__()
+        self.predictor_net = mlp([obs_dim + act_dim] + list(hidden_sizes) + [obs_dim], activation)
+    def forward(self, obs):
+        return self.predictor_net(obs)
 
+#class MLPCriticPredictorHybrid(nn.Module):
+#   def __init__(self, critic):
+#        super().__init__()
+#        self
 
 class MLPActorCritic(nn.Module):
 
@@ -117,11 +128,19 @@ class MLPActorCritic(nn.Module):
         # policy builder depends on action space
         if isinstance(action_space, Box):
             self.pi = MLPGaussianActor(obs_dim, action_space.shape[0], hidden_sizes, activation)
+            # predictor also depends on action space
+            # self.predictor = MLPPredictor(obs_dim, action_space.shape[0], hidden_sizes, activation)
         elif isinstance(action_space, Discrete):
             self.pi = MLPCategoricalActor(obs_dim, action_space.n, hidden_sizes, activation)
+            # predictor also depends on action space
+            # self.predictor = MLPPredictor(obs_dim, action_space.n, hidden_sizes, activation)
+            # predictor treats action as a float (as we have a single decision)
+            # perhaps this should be a 1-hot (in which case, we want action_space.n, not 1)
+            self.predictor = MLPPredictor(obs_dim, 1, hidden_sizes, activation)
 
         # build value function
         self.v  = MLPCritic(obs_dim, hidden_sizes, activation)
+
 
     def step(self, obs):
         with torch.no_grad():
@@ -129,7 +148,12 @@ class MLPActorCritic(nn.Module):
             a = pi.sample()
             logp_a = self.pi._log_prob_from_distribution(pi, a)
             v = self.v(obs)
-        return a.numpy(), v.numpy(), logp_a.numpy()
+            NUM_ACTIONS = 4.0 # TODO: get this from parameter
+            # observation with action concatenated
+            # perhaps this should be 1-hot rather than single parameter...
+            obs_cat_action = torch.cat((obs, torch.unsqueeze(a/NUM_ACTIONS, 0)), 0)
+            prediction = self.predictor(obs_cat_action)
+        return a.numpy(), v.numpy(), logp_a.numpy(), prediction
 
     def act(self, obs):
         return self.step(obs)[0]
